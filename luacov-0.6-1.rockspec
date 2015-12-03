@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "LuaCov"
-version = "0.5-1"
+version = "0.6-1"
 -- LuaDist source
 source = {
-  tag = "0.5-1",
+  tag = "0.6-1",
   url = "git://github.com/LuaDist2/luacov.git"
 }
 -- Original source
 -- source = {
 --    url = "git://github.com/keplerproject/luacov",
---    tag = "v0.5"
+--    tag = "v0.6"
 -- }
 description = {
    summary = "Coverage analysis tool for Lua scripts",
@@ -31,16 +31,17 @@ dependencies = {
 build = {
    type = "builtin",
    modules = {
-      luacov = "src/luacov.lua",
-      ['luacov.defaults'] = "src/luacov/defaults.lua",
-      ['luacov.reporter'] = "src/luacov/reporter.lua",
-      ['luacov.runner'] = "src/luacov/runner.lua",
-      ['luacov.stats'] = "src/luacov/stats.lua",
-      ['luacov.tick'] = "src/luacov/tick.lua"
+      ["luacov.defaults"] = "src/luacov/defaults.lua",
+      ["luacov"] = "src/luacov.lua",
+      ["luacov.reporter"] = "src/luacov/reporter.lua",
+      ["luacov.reporter.default"] = "src/luacov/reporter/default.lua",
+      ["luacov.runner"] = "src/luacov/runner.lua",
+      ["luacov.stats"] = "src/luacov/stats.lua",
+      ["luacov.tick"] = "src/luacov/tick.lua",
    },
    install = {
       bin = {
-         luacov = "src/bin/luacov"
+         ["luacov"] = "src/bin/luacov",
       }
    }
 }

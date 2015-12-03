@@ -19,25 +19,30 @@ return {
 
   -- Delete stats file after reporting?
   deletestats = false,
+  
+  -- Process Lua code loaded from raw strings
+  -- (that is, when the 'source' field in the debug info
+  -- does not start with '@')
+  codefromstrings = false,
 
   -- Patterns for files to include when reporting
   -- all will be included if nothing is listed
   -- (exclude overrules include, do not include
-  -- the .lua extension)
+  -- the .lua extension, path separator is always '/')
   ["include"] = {
   },
 
   -- Patterns for files to exclude when reporting
   -- all will be included if nothing is listed
   -- (exclude overrules include, do not include
-  -- the .lua extension)
+  -- the .lua extension, path separator is always '/')
   ["exclude"] = {
     "luacov$",
-    "luacov%.reporter$",
-    "luacov%.defaults$",
-    "luacov%.runner$",
-    "luacov%.stats$",
-    "luacov%.tick$",
+    "luacov/reporter$",
+    "luacov/defaults$",
+    "luacov/runner$",
+    "luacov/stats$",
+    "luacov/tick$",
   },
 
 
