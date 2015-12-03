@@ -1,15 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "LuaCov"
-version = "0.2-1"
+version = "0.3-1"
 -- LuaDist source
 source = {
-  tag = "0.2-1",
+  tag = "0.3-1",
   url = "git://github.com/LuaDist2/luacov.git"
 }
 -- Original source
 -- source = {
---    url = "http://luaforge.net/frs/download.php/4053/luacov-0.2.tar.gz"
+--    url = "git://github.com/keplerproject/luacov",
+--    tag = "v0.3",
 -- }
 description = {
    summary = "Coverage analysis tool for Lua scripts",
@@ -22,15 +23,24 @@ description = {
       effectiveness of a test suite.
    ]],
    license = "MIT/X11",
-   homepage = "http://luacov.luaforge.net/"
+   homepage = "http://keplerproject.github.com/luacov/"
 }
 dependencies = {
-   "lua >= 5.0",
+   "lua >= 5.1",
 }
 build = {
-   type = "make",
-   variables = {
-      LUADIR = "$(LUADIR)",
-      BINDIR = "$(BINDIR)"
-   }
+  type = "builtin",
+  modules = {
+    ["luacov.defaults"] = "src/luacov/defaults.lua",
+    ["luacov"] = "src/luacov.lua",
+    ["luacov.reporter"] = "src/luacov/reporter.lua",
+    ["luacov.runner"] = "src/luacov/runner.lua",
+    ["luacov.stats"] = "src/luacov/stats.lua",
+    ["luacov.tick"] = "src/luacov/tick.lua",
+  },
+  install = {
+    bin = {
+      ["luacov"] = "src/bin/luacov",
+    }
+  }
 }
