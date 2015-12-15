@@ -6,7 +6,7 @@ local reporter = {}
 
 local luacov = require("luacov.runner")
 
---- Raw version of string.gsub
+-- Raw version of string.gsub
 local function replace(s, old, new)
    old = old:gsub("%p", "%%%0")
    new = new:gsub("%%", "%%%%")
@@ -18,13 +18,14 @@ local fixups = {
    { "(", " ?%( ?" }, -- '(' may be surrounded by spaces
    { ")", " ?%) ?" }, -- ')' may be surrounded by spaces
    { "<ID>", "[%w_]+" }, -- identifier
-   { "<FULLID>", "[%w_][%w_%.%[%]]+" }, -- identifier, possibly indexed
-   { "<IDS>", "[%w_, ]+" }, -- comma-separated identifiers
+   { "<FULLID>", "[%w_]+[%[%.]?[%w_']*%]?" }, -- identifier, possibly indexed once
+   { "<IDS>", "[%w_ ]+,[%w_, ]+" }, -- at least two comma-separated identifiers
    { "<ARGS>", "[%w_, '%.]*" }, -- comma-separated arguments
    { "<FIELDNAME>", "%[? ?['%w_]+ ?%]?" }, -- field, possibly like ["this"]
+   { "<PARENS>", "[ %(]*" }, -- optional opening parentheses
 }
 
---- Utility function to make patterns more readable
+-- Utility function to make patterns more readable
 local function fixup(pat)
    for _, fixup_pair in ipairs(fixups) do
       pat = replace(pat, fixup_pair[1], fixup_pair[2])
@@ -44,24 +45,30 @@ local any_hits_exclusions = {
    "then", -- Single "then"
    "while true do", -- "while true do" generates no code
    "if true then", -- "if true then" generates no code
+   fixup "local <ID>", -- "local var"
+   fixup "local <ID>=", -- "local var ="
    fixup "local <IDS>", -- "local var1, ..., varN"
    fixup "local <IDS>=", -- "local var1, ..., varN ="
-   fixup "local function(<ARGS>)", -- "local function(arg1, ..., argN)"
-   fixup "local function <ID>(<ARGS>)", -- "local function f (arg1, ..., argN)"
+   fixup "local function <ID>", -- "local function f (arg1, ..., argN)"
 }
 
 --- Lines that are only excluded from accounting when they have 0 hits
 local zero_hits_exclusions = {
    "[%w_,=' ]+,", -- "var1 var2," multi columns table stuff
    fixup "<FIELDNAME>=.+[,;]", -- "[123] = 23," "['foo'] = "asd","
-   fixup "<ARGS>*function(<ARGS>)", -- "1,2,function(...)"
-   fixup "return <ARGS>*function(<ARGS>)", -- "return 1,2,function(...)"
-   fixup "return function(<ARGS>)", -- "return function(arg1, ..., argN)"
-   fixup "function(<ARGS>)", -- "function(arg1, ..., argN)"
-   fixup "local <ID>=function(<ARGS>)", -- "local a = function(arg1, ..., argN)"
-   fixup "local <ID>='", -- local a = [[
-   fixup "<FULLID>='", -- a.b = [[
-   fixup "<FULLID>=function(<ARGS>)", -- "a = function(arg1, ..., argN)"
+   fixup "<FIELDNAME>=function", -- "[123] = function(...)"
+   fixup "<FIELDNAME>=<PARENS>'", -- "[123] = [[", possibly with opening parens
+   fixup "<ARGS>*function", -- "1,2,function(...)"
+   fixup "return <ARGS>*function", -- "return 1,2,function(...)"
+   "return function", -- "return function(arg1, ..., argN)"
+   "function", -- "function(arg1, ..., argN)"
+   fixup "local <ID>=function", -- "local a = function(arg1, ..., argN)"
+   fixup "local <ID>=<PARENS>'", -- "local a = [[", possibly with opening parens
+   fixup "local <ID>=nil", -- "local a = nil; local b = nil" produces no trace for the second statement
+   fixup "<FULLID>=<PARENS>'", -- "a.b = [[", possibly with opening parens
+   fixup "<FULLID>=function", -- "a = function(arg1, ..., argN)"
+   "} ?,", -- "}," generates no trace if the table ends with a key-value pair
+   "} ?, ?function", -- same with "}, function(...)"
    "break", -- "break" generates no trace in Lua 5.2+
    "{", -- "{" opening table
    "}?[ %)]*", -- optional "{" closing table, possibly with several closing parens
@@ -81,7 +88,7 @@ local LineScanner = {} do
 LineScanner.__index = LineScanner
 
 function LineScanner:new()
-   return setmetatable({first = true, comment = false}, self)
+   return setmetatable({first = true, comment = false, after_function = false}, self)
 end
 
 function LineScanner:find(pattern)
@@ -128,6 +135,20 @@ function LineScanner:skip_long_string()
    end
 end
 
+-- Skips function arguments.
+-- @return boolean indicating success.
+function LineScanner:skip_args()
+   local _, paren_i = self:find("%)")
+
+   if paren_i then
+      self.i = paren_i + 1
+      self.args = nil
+      return true
+   else
+      return false
+   end
+end
+
 function LineScanner:skip_whitespace()
    local next_i = self:find("%S") or #self.line + 1
 
@@ -161,6 +182,11 @@ function LineScanner:skip_name()
    local _, _, name = self:find("^([%w_]*)")
    self.i = self.i + #name
    table.insert(self.simple_line_buffer, name)
+
+   if name == "function" then
+      -- This flag indicates that the next pair of parentheses (function args) must be skipped.
+      self.after_function = true
+   end
 end
 
 -- Consumes and analyzes a line.
@@ -182,6 +208,7 @@ function LineScanner:consume(line)
    -- Literal strings are replaced with "''", so that a string literal
    -- containing special characters does not confuse exclusion rules.
    -- Numbers are replaced with "0".
+   -- Function declaration arguments are removed.
    self.simple_line_buffer = {}
    self.i = 1
 
@@ -196,6 +223,11 @@ function LineScanner:consume(line)
       elseif self.equals then
          if not self:skip_long_string() then
             -- Long string literal or comment ends on another line.
+            break
+         end
+      elseif self.args then
+         if not self:skip_args() then
+            -- Function arguments end on another line.
             break
          end
       else
@@ -243,6 +275,10 @@ function LineScanner:consume(line)
                   if char == "'" or char == '"' then
                      table.insert(self.simple_line_buffer, "'")
                      self.quote = char
+                  elseif self.after_function and char == "(" then
+                     -- This is the opening parenthesis of function declaration args.
+                     self.after_function = false
+                     self.args = true
                   else
                      -- Save other punctuation literally.
                      -- This inserts an empty string when at the end of line,
@@ -262,6 +298,16 @@ end
 end
 
 ----------------------------------------------------------------
+--- Basic reporter class stub.
+-- Implements 'new', 'run' and 'close' methods required by `report`.
+-- Provides some helper methods and stubs to be overridden by child classes.
+-- @usage
+-- local MyReporter = setmetatable({}, ReporterBase)
+-- MyReporter.__index = MyReporter
+-- function MyReporter:on_hit_line(...)
+--    self:write(("File %s: hit line %s %d times"):format(...))
+-- end
+-- @type ReporterBase
 local ReporterBase = {} do
 ReporterBase.__index = ReporterBase
 
@@ -312,14 +358,19 @@ function ReporterBase:new(conf)
    return o
 end
 
+--- Returns configuration table.
+-- @see luacov.defaults
 function ReporterBase:config()
    return self._cfg
 end
 
+--- Returns maximum number of hits per line in all coverage data.
 function ReporterBase:max_hits()
    return self._mhit
 end
 
+--- Writes strings to report file.
+-- @param ... strings.
 function ReporterBase:write(...)
    return self._out:write(...)
 end
@@ -329,32 +380,58 @@ function ReporterBase:close()
    self._private = nil
 end
 
+--- Returns array of filenames to be reported.
 function ReporterBase:files()
    return self._files
 end
 
+--- Returns coverage data for a file.
+-- @param filename name of the file.
+-- @see luacov.stats.load
 function ReporterBase:stats(filename)
    return self._data[filename]
 end
 
+--- Stub method called before reporting.
 function ReporterBase:on_start()
 end
 
+--- Stub method called before processing a file.
+-- @param filename name of the file.
 function ReporterBase:on_new_file(filename)
 end
 
+--- Stub method called for each empty source line
+-- and other lines that can't be hit.
+-- @param filename name of the file.
+-- @param lineno line number.
+-- @param line the line itself as a string.
 function ReporterBase:on_empty_line(filename, lineno, line)
 end
 
+--- Stub method called for each missed source line.
+-- @param filename name of the file.
+-- @param lineno line number.
+-- @param line the line itself as a string.
 function ReporterBase:on_mis_line(filename, lineno, line)
 end
 
+--- Stub method called for each hit source line.
+-- @param filename name of the file.
+-- @param lineno line number.
+-- @param line the line itself as a string.
+-- @param hits number of times the line was hit. Should be positive.
 function ReporterBase:on_hit_line(filename, lineno, line, hits)
 end
 
+--- Stub method called after a file has been processed.
+-- @param filename name of the file.
+-- @param hits total number of hit lines in the file.
+-- @param miss total number of missed lines in the file.
 function ReporterBase:on_end_file(filename, hits, miss)
 end
 
+--- Stub method called after reporting.
 function ReporterBase:on_end()
 end
 
@@ -363,10 +440,12 @@ function ReporterBase:run()
 
    for _, filename in ipairs(self:files()) do
       local file = io.open(filename, "r")
-      local file_hits, file_miss = 0, 0
-      local ok, err
-      if file then ok, err = pcall(function() -- try
+
+      if not file then
+         print("Could not open file " .. filename)
+      else
          self:on_new_file(filename)
+         local file_hits, file_miss = 0, 0
          local filedata = self:stats(filename)
 
          local line_nr = 1
@@ -391,9 +470,8 @@ function ReporterBase:run()
 
             line_nr = line_nr + 1
          end
-      end) -- finally
+
          file:close()
-         assert(ok, err)
          self:on_end_file(filename, file_hits, file_miss)
       end
    end
@@ -402,6 +480,7 @@ function ReporterBase:run()
 end
 
 end
+--- @section end
 ----------------------------------------------------------------
 
 ----------------------------------------------------------------
@@ -471,6 +550,16 @@ end
 end
 ----------------------------------------------------------------
 
+--- Runs the report generator.
+-- To load a config, use `luacov.runner.load_config` first.
+-- @param[opt] reporter_class custom reporter class. Will be
+-- instantiated using 'new' method with configuration
+-- (see `luacov.defaults`) as the argument. It should
+-- return nil + error if something went wrong.
+-- After acquiring a reporter object its 'run' and 'close'
+-- methods will be called.
+-- The easiest way to implement a custom reporter class is to
+-- extend `ReporterBase`.
 function reporter.report(reporter_class)
    local configuration = luacov.load_config()
 

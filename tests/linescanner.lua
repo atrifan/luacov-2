@@ -40,7 +40,7 @@ end
 
 -- First line used to be annotated as excluded, but was not actually excluded.
 test [[
-   local thing = nil +
+   local thing = nil ?
    print("test1")    +
 ]]
 
@@ -48,7 +48,7 @@ test [[
    local stuff = function (x) return x end +
    local thing = stuff({                   +
       b = { name = 'bob',                  ?
-      },                                   +
+      },                                   ?
       -- comment                           -
    })                                      ?
    print("test2")                          +
@@ -58,7 +58,7 @@ test [[
    local stuff = function (x) return x end +
    local thing = stuff({                   +
       b = { name = 'bob',                  ?
-      },                                   +
+      },                                   ?
       -- comment                           -
    }                                       ?
    )                                       ?
@@ -162,9 +162,27 @@ abc          -
 ]=]
 
 test [=[
+s = [[ ?
+abc    -
+]]     +
+]=]
+
+test [=[
 t.k = [[ ?
 abc      -
 ]]       +
+]=]
+
+test [=[
+t.k1.k2 = [[ +
+abc          -
+]]           +
+]=]
+
+test [=[
+t["k"] = [[ ?
+abc         -
+]]          +
 ]=]
 
 -- Inline long comments.
@@ -189,8 +207,92 @@ print(a)       +
 ]=]
 
 test [=[
-local a = ("\     +
+local a = ("\     ?
 local function(") +
 ]=]
+
+-- String declarations with parentheses.
+test [=[
+local a = ([[   ?
+format %string  -
+]]):format(var) +
+]=]
+
+-- Incomplete function declarations.
+test [[
+local function fff(a, -
+   b,                 -
+   c)                 -
+   return a + b + c   +
+end                   -
+]]
+
+test [[
+local function fff( -
+      a, b, c)      -
+   return a + b + c +
+end                 -
+]]
+
+test [[
+local function fff  -
+      (a, b, c)     -
+   return a + b + c +
+end                 -
+]]
+
+-- Local declarations
+test [[
+local function f() end +
+local x                -
+local x, y             -
+local x =              -
+1                      +
+local x, y =           -
+2, 3                   +
+]]
+
+test [[
+local x = nil     ?
+                  -
+for i = 1, 100 do +
+   x = 1          +
+end               -
+]]
+
+-- Multiline declarations in tables.
+test [=[
+local t = {           +
+   ["1"] = function() ?
+      foo()           +
+   end,               -
+   ["2"] = ([[        ?
+      %s              -
+   ]]):format(var),   +
+   ["3"] = [[         ?
+      bar()           -
+   ]]                 +
+}                     ?
+]=]
+
+-- Hanging table endings.
+test [[
+local v = f({ +
+   a = "foo", ?
+   x = y      +
+},            ?
+function(g)   ?
+   g()        +
+end)          -
+]]
+
+test [[
+local v = f({  +
+   a = "foo",  ?
+   x = y       +
+}, function(g) ?
+   g()         +
+end)           -
+]]
 
 print(("%d LineScanner tests passed."):format(ntests))

@@ -1,6 +1,6 @@
 ---------------------------------------------------
 -- Statistics collecting module.
--- Calling the module table is a shortcut to calling the <code>init()</code> method.
+-- Calling the module table is a shortcut to calling the `init` function.
 -- @class module
 -- @name luacov.runner
 
@@ -24,6 +24,7 @@ local data
 local statsfile
 local tick
 local paused = true
+local initialized = false
 local ctr = 0
 
 local filelist = {}
@@ -39,7 +40,7 @@ local function match_any(patterns, str, on_empty)
    end
 
    for _, pattern in ipairs(patterns) do
-      if str:match(pattern) then
+      if string.match(str, pattern) then
          return true
       end
    end
@@ -53,7 +54,8 @@ end
 -- @return true if file is included, false otherwise.
 function runner.file_included(filename)
    -- Normalize file names before using patterns.
-   filename = filename:gsub("\\", "/"):gsub("%.lua$", "")
+   filename = string.gsub(filename, "\\", "/")
+   filename = string.gsub(filename, "%.lua$", "")
 
    if filelist[filename] == nil then
       -- If include list is empty, everything is included by default.
@@ -84,7 +86,14 @@ function runner.update_stats(old_stats, extra_stats)
    end
 end
 
+-- Do not use string metamethods within this function:
+-- they may be absent if it's called from a sandboxed environment
+-- or because of carelessly implemented monkey-patching.
 local function on_line(_, line_nr)
+   if not initialized then
+      return
+   end
+
    if tick then
       ctr = ctr + 1
       if ctr == runner.configuration.savestepsize then
@@ -98,8 +107,8 @@ local function on_line(_, line_nr)
 
    -- get name of processed file; ignore Lua code loaded from raw strings
    local name = debug.getinfo(2, "S").source
-   if name:match("^@") then
-      name = name:sub(2)
+   if string.match(name, "^@") then
+      name = string.sub(name, 2)
    elseif not runner.configuration.codefromstrings then
       return
    end
@@ -122,9 +131,9 @@ end
 
 ------------------------------------------------------
 -- Runs the reporter specified in configuration.
--- @param configuration if string, filename of config file (used to call <code>load_config</code>).
--- If table then config table (see file <code>luacov.default.lua</code> for an example).
--- If <code>configuration.reporter<code> is not set, runs the default reporter;
+-- @param[opt] configuration if string, filename of config file (used to call `load_config`).
+-- If table then config table (see file `luacov.default.lua` for an example).
+-- If `configuration.reporter` is not set, runs the default reporter;
 -- otherwise, it must be a module name in 'luacov.reporter' namespace.
 -- The module must contain 'report' function, which is called without arguments.
 function runner.run_report(configuration)
@@ -175,9 +184,13 @@ local function escape_module_punctuation(ch)
 end
 
 -- This function is used for sorting module names.
--- More specific (longer) names should come first.
+-- More specific names (names with less wildcards) should come first.
+-- E.g. rule for 'foo.bar' should override rule for 'foo.*'
+-- and rule for 'foo.*' should override rule for 'foo.*.*'.
 local function compare_names(name1, name2)
-   return #name1 > #name2 or name1 < name2
+   local _, wildcards1 = name1:gsub("%*", "")
+   local _, wildcards2 = name2:gsub("%*", "")
+   return wildcards1 < wildcards2 or (wildcards1 == wildcards2 and name1 < name2)
 end
 
 -- Sets runner.modules using runner.configuration.modules.
@@ -221,7 +234,7 @@ end
 
 --------------------------------------------------
 -- Returns real name for a source file name
--- using <code>modules</code> option.
+-- using `luacov.defaults.modules` option.
 function runner.real_name(filename)
    local orig_filename = filename
    -- Normalize file names before using patterns.
@@ -251,6 +264,17 @@ function runner.real_name(filename)
    return orig_filename
 end
 
+-- Always exclude luacov's own files.
+local luacov_excludes = {
+   "luacov$",
+   "luacov/reporter$",
+   "luacov/reporter/default$",
+   "luacov/defaults$",
+   "luacov/runner$",
+   "luacov/stats$",
+   "luacov/tick$"
+}
+
 -- Sets configuration. If some options are missing, default values are used instead.
 local function set_config(configuration)
    runner.configuration = {}
@@ -264,21 +288,27 @@ local function set_config(configuration)
    end
 
    acknowledge_modules()
+
+   for _, patt in ipairs(luacov_excludes) do
+      table.insert(runner.configuration.exclude, patt)
+   end
 end
+
+local default_config_file = ".luacov"
 
 ------------------------------------------------------
 -- Loads a valid configuration.
--- @param configuration user provided config (config-table or filename)
+-- @param[opt] configuration user provided config (config-table or filename)
 -- @return existing configuration if already set, otherwise loads a new
 -- config from the provided data or the defaults.
 -- When loading a new config, if some options are missing, default values
--- are used instead.
+-- from `luacov.defaults` are used instead.
 function runner.load_config(configuration)
    if not runner.configuration then
       if not configuration then
          -- nothing provided, load from default location if possible
-         if file_exists(runner.defaults.configfile) then
-            set_config(dofile(runner.defaults.configfile))
+         if file_exists(default_config_file) then
+            set_config(dofile(default_config_file))
          else
             set_config(runner.defaults)
          end
@@ -355,10 +385,48 @@ function runner.resume()
    paused = false
 end
 
+local hook_per_thread
+
+-- Determines whether debug hooks are separate for each thread.
+local function has_hook_per_thread()
+   if hook_per_thread == nil then
+      local old_hook, old_mask, old_count = debug.gethook()
+      local noop = function() end
+      debug.sethook(noop, "l")
+      local thread_hook = coroutine.wrap(debug.gethook)()
+      hook_per_thread = thread_hook ~= noop
+      debug.sethook(old_hook, old_mask, old_count)
+   end
+
+   return hook_per_thread
+end
+
+--------------------------------------------------
+-- Wraps a function, enabling coverage gathering in it explicitly.
+-- LuaCov gathers coverage using a debug hook, and patches coroutine
+-- library to set it on created threads when under standard Lua, where each
+-- coroutine has its own hook. If a coroutine is created using Lua C API
+-- or before the monkey-patching, this wrapper should be applied to the
+-- main function of the coroutine. Under LuaJIT this function is redundant,
+-- as there is only one, global debug hook.
+-- @param f a function
+-- @return a function that enables coverage gathering and calls the original function.
+-- @usage
+-- local coro = coroutine.create(runner.with_luacov(func))
+function runner.with_luacov(f)
+   return function(...)
+      if has_hook_per_thread() then
+         debug.sethook(on_line, "l")
+      end
+
+      return f(...)
+   end
+end
+
 --------------------------------------------------
 -- Initializes LuaCov runner to start collecting data.
--- @param configuration if string, filename of config file (used to call <code>load_config</code>).
--- If table then config table (see file <code>luacov.default.lua</code> for an example)
+-- @param[opt] configuration if string, filename of config file (used to call `load_config`).
+-- If table then config table (see file `luacov.default.lua` for an example)
 function runner.init(configuration)
    runner.configuration = runner.load_config(configuration)
    stats.statsfile = runner.configuration.statsfile
@@ -375,33 +443,36 @@ function runner.init(configuration)
 
    debug.sethook(on_line, "l")
 
-   -- debug must be set for each coroutine separately
-   -- hence wrap coroutine function to set the hook there
-   -- as well
-   local rawcoroutinecreate = coroutine.create
-   coroutine.create = function(...)
-      local co = rawcoroutinecreate(...)
-      debug.sethook(co, on_line, "l")
-      return co
-   end
+   if has_hook_per_thread() then
+      -- debug must be set for each coroutine separately
+      -- hence wrap coroutine function to set the hook there
+      -- as well
+      local rawcoroutinecreate = coroutine.create
+      coroutine.create = function(...)
+         local co = rawcoroutinecreate(...)
+         debug.sethook(co, on_line, "l")
+         return co
+      end
 
-   -- Version of assert which handles non-string errors properly.
-   local function safeassert(ok, ...)
-      if ok then
-         return ...
-      else
-         error(..., 0)
+      -- Version of assert which handles non-string errors properly.
+      local function safeassert(ok, ...)
+         if ok then
+            return ...
+         else
+            error(..., 0)
+         end
+      end
+
+      coroutine.wrap = function(...)
+         local co = rawcoroutinecreate(...)
+         debug.sethook(co, on_line, "l")
+         return function(...)
+            return safeassert(coroutine.resume(co, ...))
+         end
       end
    end
 
-   coroutine.wrap = function(...)
-      local co = rawcoroutinecreate(...)
-      debug.sethook(co, on_line, "l")
-      return function(...)
-         return safeassert(coroutine.resume(co, ...))
-      end
-   end
-
+   initialized = true
 end
 
 --------------------------------------------------
@@ -528,44 +599,45 @@ local function checkresult(ok, ...)
 end
 
 -------------------------------------------------------------------
--- Adds a file to the exclude list (see <code>defaults.lua</code>).
+-- Adds a file to the exclude list (see `luacov.defaults`).
 -- If passed a function, then through debuginfo the source filename is collected. In case of a table
 -- it will recursively search the table for a function, which is then resolved to a filename through debuginfo.
 -- If the parameter is a string, it will first check if a file by that name exists. If it doesn't exist
--- it will call <code>require(name)</code> to load a module by that name, and the result of require (function or
+-- it will call `require(name)` to load a module by that name, and the result of require (function or
 -- table expected) is used as described above to get the sourcefile.
--- @param name string;   literal filename,
---             string;   modulename as passed to require(),
---             function; where containing file is looked up,
---             table;    module table where containing file is looked up
+-- @param name
+-- * string;   literal filename,
+-- * string;   modulename as passed to require(),
+-- * function; where containing file is looked up,
+-- * table;    module table where containing file is looked up
 -- @return the pattern as added to the list, or nil + error
 function runner.excludefile(name)
   return checkresult(pcall(addfiletolist, name, runner.configuration.exclude))
 end
 -------------------------------------------------------------------
--- Adds a file to the include list (see <code>defaults.lua</code>).
--- @param name see <code>excludefile</code>
+-- Adds a file to the include list (see `luacov.defaults`).
+-- @param name see `excludefile`
 -- @return the pattern as added to the list, or nil + error
 function runner.includefile(name)
   return checkresult(pcall(addfiletolist, name, runner.configuration.include))
 end
 -------------------------------------------------------------------
--- Adds a tree to the exclude list (see <code>defaults.lua</code>).
--- If <code>name = 'luacov'</code> and <code>level = nil</code> then
+-- Adds a tree to the exclude list (see `luacov.defaults`).
+-- If `name = 'luacov'` and `level = nil` then
 -- module 'luacov' (luacov.lua) and the tree 'luacov' (containing `luacov/runner.lua` etc.) is excluded.
--- If <code>name = 'pl.path'</code> and <code>level = true</code> then
+-- If `name = 'pl.path'` and `level = true` then
 -- module 'pl' (pl.lua) and the tree 'pl' (containing `pl/path.lua` etc.) is excluded.
 -- NOTE: in case of an 'init.lua' file, the 'level' parameter will always be set
--- @param name see <code>excludefile</code>
+-- @param name see `excludefile`
 -- @param level if truthy then one level up is added, including the tree
 -- @return the 2 patterns as added to the list (file and tree), or nil + error
 function runner.excludetree(name, level)
   return checkresult(pcall(addtreetolist, name, level, runner.configuration.exclude))
 end
 -------------------------------------------------------------------
--- Adds a tree to the include list (see <code>defaults.lua</code>).
--- @param name see <code>excludefile</code>
--- @param level see <code>includetree</code>
+-- Adds a tree to the include list (see `luacov.defaults`).
+-- @param name see `excludefile`
+-- @param level see `includetree`
 -- @return the 2 patterns as added to the list (file and tree), or nil + error
 function runner.includetree(name, level)
   return checkresult(pcall(addtreetolist, name, level, runner.configuration.include))
