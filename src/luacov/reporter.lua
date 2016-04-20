@@ -17,11 +17,9 @@ local fixups = {
    { "=", " ?= ?" }, -- '=' may be surrounded by spaces
    { "(", " ?%( ?" }, -- '(' may be surrounded by spaces
    { ")", " ?%) ?" }, -- ')' may be surrounded by spaces
-   { "<ID>", "[%w_]+" }, -- identifier
-   { "<FULLID>", "[%w_]+[%[%.]?[%w_']*%]?" }, -- identifier, possibly indexed once
-   { "<IDS>", "[%w_ ]+,[%w_, ]+" }, -- at least two comma-separated identifiers
-   { "<ARGS>", "[%w_, '%.]*" }, -- comma-separated arguments
-   { "<FIELDNAME>", "%[? ?['%w_]+ ?%]?" }, -- field, possibly like ["this"]
+   { "<FULLID>", "x ?[%[%.]? ?[ntfx0']* ?%]?" }, -- identifier, possibly indexed once
+   { "<IDS>", "x ?, ?x[x, ]*" }, -- at least two comma-separated identifiers
+   { "<FIELDNAME>", "%[? ?[ntfx0']+ ?%]?" }, -- field, possibly like ["this"]
    { "<PARENS>", "[ %(]*" }, -- optional opening parentheses
 }
 
@@ -43,35 +41,41 @@ local any_hits_exclusions = {
    "do", -- Single "do"
    "if", -- Single "if"
    "then", -- Single "then"
-   "while true do", -- "while true do" generates no code
-   "if true then", -- "if true then" generates no code
-   fixup "local <ID>", -- "local var"
-   fixup "local <ID>=", -- "local var ="
+   "while t do", -- "while true do" generates no code
+   "if t then", -- "if true then" generates no code
+   "local x", -- "local var"
+   fixup "local x=", -- "local var ="
    fixup "local <IDS>", -- "local var1, ..., varN"
    fixup "local <IDS>=", -- "local var1, ..., varN ="
-   fixup "local function <ID>", -- "local function f (arg1, ..., argN)"
+   "local function x", -- "local function f (arg1, ..., argN)"
 }
 
 --- Lines that are only excluded from accounting when they have 0 hits
 local zero_hits_exclusions = {
-   "[%w_,=' ]+,", -- "var1 var2," multi columns table stuff
+   "[ntfx0',= ]+,", -- "var1 var2," multi columns table stuff
+   "{ ?} ?,", -- Empty table before comma leaves no trace in tables and calls
    fixup "<FIELDNAME>=.+[,;]", -- "[123] = 23," "['foo'] = "asd","
    fixup "<FIELDNAME>=function", -- "[123] = function(...)"
    fixup "<FIELDNAME>=<PARENS>'", -- "[123] = [[", possibly with opening parens
-   fixup "<ARGS>*function", -- "1,2,function(...)"
-   fixup "return <ARGS>*function", -- "return 1,2,function(...)"
    "return function", -- "return function(arg1, ..., argN)"
    "function", -- "function(arg1, ..., argN)"
-   fixup "local <ID>=function", -- "local a = function(arg1, ..., argN)"
-   fixup "local <ID>=<PARENS>'", -- "local a = [[", possibly with opening parens
-   fixup "local <ID>=nil", -- "local a = nil; local b = nil" produces no trace for the second statement
+   "[ntfx0]", -- Single token expressions leave no trace in tables, function calls and sometimes assignments
+   "''", -- Same for strings
+   "{ ?}", -- Same for empty tables
+   fixup "<FULLID>", -- Same for local variables indexed once
+   fixup "local x=function", -- "local a = function(arg1, ..., argN)"
+   fixup "local x=<PARENS>'", -- "local a = [[", possibly with opening parens
+   fixup "local x=(<PARENS>", -- "local a = (", possibly with several parens
+   fixup "local <IDS>=(<PARENS>", -- "local a, b = (", possibly with several parens
+   fixup "local x=n", -- "local a = nil; local b = nil" produces no trace for the second statement
    fixup "<FULLID>=<PARENS>'", -- "a.b = [[", possibly with opening parens
    fixup "<FULLID>=function", -- "a = function(arg1, ..., argN)"
    "} ?,", -- "}," generates no trace if the table ends with a key-value pair
    "} ?, ?function", -- same with "}, function(...)"
    "break", -- "break" generates no trace in Lua 5.2+
    "{", -- "{" opening table
-   "}?[ %)]*", -- optional "{" closing table, possibly with several closing parens
+   "}?[ %)]*", -- optional closing paren, possibly with several closing parens
+   "[ntf0']+ ?}[ %)]*" -- a constant at the end of a table, possibly with closing parens (for LuaJIT)
 }
 
 local function excluded(exclusions, line)
@@ -177,10 +181,25 @@ function LineScanner:skip_number()
    table.insert(self.simple_line_buffer, "0")
 end
 
+local keywords = {["nil"] = "n", ["true"] = "t", ["false"] = "f"}
+
+for _, keyword in ipairs({
+      "and", "break", "do", "else", "elseif", "end", "for", "function", "goto", "if",
+      "in", "local", "not", "or", "repeat", "return", "then", "until", "while"}) do
+   keywords[keyword] = keyword
+end
+
 function LineScanner:skip_name()
    -- It is guaranteed that the first character matches "%a_".
    local _, _, name = self:find("^([%w_]*)")
    self.i = self.i + #name
+
+   if keywords[name] then
+      name = keywords[name]
+   else
+      name = "x"
+   end
+
    table.insert(self.simple_line_buffer, name)
 
    if name == "function" then
@@ -204,10 +223,13 @@ function LineScanner:consume(line)
 
    self.line = line
    -- As scanner goes through the line, it puts its simplified parts into buffer.
-   -- Identifiers and punctuation are preserved. Whitespace is replaced with single space.
+   -- Punctuation is preserved. Whitespace is replaced with single space.
    -- Literal strings are replaced with "''", so that a string literal
    -- containing special characters does not confuse exclusion rules.
    -- Numbers are replaced with "0".
+   -- Identifiers are replaced with "x".
+   -- Literal keywords (nil, true and false) are replaced with "n", "t" and "f",
+   -- other keywords are preserved.
    -- Function declaration arguments are removed.
    self.simple_line_buffer = {}
    self.i = 1
@@ -313,9 +335,7 @@ ReporterBase.__index = ReporterBase
 
 function ReporterBase:new(conf)
    local stats = require("luacov.stats")
-
-   stats.statsfile = conf.statsfile
-   local data = stats.load()
+   local data = stats.load(conf.statsfile)
 
    if not data then
       return nil, "Could not load stats file " .. conf.statsfile .. "."
@@ -392,6 +412,9 @@ function ReporterBase:stats(filename)
    return self._data[filename]
 end
 
+-- Stub methods follow.
+-- luacheck: push no unused args
+
 --- Stub method called before reporting.
 function ReporterBase:on_start()
 end
@@ -434,6 +457,8 @@ end
 --- Stub method called after reporting.
 function ReporterBase:on_end()
 end
+
+-- luacheck: pop
 
 function ReporterBase:run()
    self:on_start()
@@ -495,56 +520,110 @@ function DefaultReporter:on_start()
    self._empty_format = (" "):rep(most_hits_length + 1)
    self._zero_format  = ("*"):rep(most_hits_length).."0"
    self._count_format = ("%% %dd"):format(most_hits_length+1)
+   self._printed_first_header = false
 end
 
 function DefaultReporter:on_new_file(filename)
-   self:write("\n")
-   self:write("==============================================================================\n")
+   self:write(("="):rep(78), "\n")
    self:write(filename, "\n")
-   self:write("==============================================================================\n")
+   self:write(("="):rep(78), "\n")
 end
 
-function DefaultReporter:on_empty_line(filename, lineno, line)
-   self:write(self._empty_format, "\t", line, "\n")
+function DefaultReporter:on_empty_line(_, _, line)
+   if line == "" then
+      self:write("\n")
+   else
+      self:write(self._empty_format, " ", line, "\n")
+   end
 end
 
-function DefaultReporter:on_mis_line(filename, lineno, line)
-   self:write(self._zero_format, "\t", line, "\n")
+function DefaultReporter:on_mis_line(_, _, line)
+   self:write(self._zero_format, " ", line, "\n")
 end
 
-function DefaultReporter:on_hit_line(filename, lineno, line, hits)
-   self:write(self._count_format:format(hits), "\t", line, "\n")
+function DefaultReporter:on_hit_line(_, _, line, hits)
+   self:write(self._count_format:format(hits), " ", line, "\n")
 end
 
 function DefaultReporter:on_end_file(filename, hits, miss)
    self._summary[filename] = { hits = hits, miss = miss }
+   self:write("\n")
+end
+
+local function coverage_to_string(hits, missed)
+   local total = hits + missed
+
+   if total == 0 then
+      total = 1
+   end
+
+   return ("%.2f%%"):format(hits/total*100.0)
 end
 
 function DefaultReporter:on_end()
-   self:write("\n")
-   self:write("==============================================================================\n")
+   self:write(("="):rep(78), "\n")
    self:write("Summary\n")
-   self:write("==============================================================================\n")
+   self:write(("="):rep(78), "\n")
    self:write("\n")
 
-   local function write_total(hits, miss, filename)
-      local total = hits + miss
-      if total == 0 then total = 1 end
+   local lines = {{"File", "Hits", "Missed", "Coverage"}}
+   local total_hits, total_missed = 0, 0
 
-      self:write(hits, "\t", miss, "\t", ("%.2f%%"):format(hits/(total)*100.0), "\t", filename, "\n")
-   end
-
-   local total_hits, total_miss = 0, 0
    for _, filename in ipairs(self:files()) do
-      local s = self._summary[filename]
-      if s then
-         write_total(s.hits, s.miss, filename)
-         total_hits = total_hits + s.hits
-         total_miss = total_miss + s.miss
+      local summary = self._summary[filename]
+
+      if summary then
+         local hits, missed = summary.hits, summary.miss
+
+         table.insert(lines, {
+            filename,
+            tostring(summary.hits),
+            tostring(summary.miss),
+            coverage_to_string(hits, missed)
+         })
+
+         total_hits = total_hits + hits
+         total_missed = total_missed + missed
       end
    end
-   self:write("------------------------\n")
-   write_total(total_hits, total_miss, "")
+
+   table.insert(lines, {
+      "Total",
+      tostring(total_hits),
+      tostring(total_missed),
+      coverage_to_string(total_hits, total_missed)
+   })
+
+   local max_column_lengths = {}
+
+   for _, line in ipairs(lines) do
+      for column_nr, column in ipairs(line) do
+         max_column_lengths[column_nr] = math.max(max_column_lengths[column_nr] or -1, #column)
+      end
+   end
+
+   local table_width = #max_column_lengths - 1
+
+   for _, column_length in ipairs(max_column_lengths) do
+      table_width = table_width + column_length
+   end
+
+
+   for line_nr, line in ipairs(lines) do
+      if line_nr == #lines or line_nr == 2 then
+         self:write(("-"):rep(table_width), "\n")
+      end
+
+      for column_nr, column in ipairs(line) do
+         self:write(column)
+
+         if column_nr == #line then
+            self:write("\n")
+         else
+            self:write((" "):rep(max_column_lengths[column_nr] - #column + 1))
+         end
+      end
+   end
 end
 
 end

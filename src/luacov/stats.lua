@@ -1,20 +1,20 @@
 -----------------------------------------------------
 -- Manages the file with statistics (being) collected.
--- In general the module requires that its property `stats.statsfile`
--- has been set to the filename of the statsfile to create, load, etc.
 -- @class module
 -- @name luacov.stats
 local stats = {}
 
 -----------------------------------------------------
 -- Loads the stats file.
--- @return table with data. The table maps filenames to stats tables.
+-- @param statsfile path to the stats file.
+-- @return table with data or nil if couldn't load.
+-- The table maps filenames to stats tables.
 -- Per-file tables map line numbers to hits or nils when there are no hits.
 -- Additionally, .max field contains maximum line number
 -- and .max_hits contains maximum number of hits in the file.
-function stats.load()
+function stats.load(statsfile)
    local data = {}
-   local fd = io.open(stats.statsfile, "r")
+   local fd = io.open(statsfile, "r")
    if not fd then
       return nil
    end
@@ -23,8 +23,7 @@ function stats.load()
       if not max then
          break
       end
-      local skip = fd:read(1)
-      if skip ~= ":" then
+      if fd:read(1) ~= ":" then
          break
       end
       local filename = fd:read("*l")
@@ -40,8 +39,7 @@ function stats.load()
          if not hits then
             break
          end
-         local skip = fd:read(1)
-         if skip ~= " " then
+         if fd:read(1) ~= " " then
             break
          end
          if hits > 0 then
@@ -54,39 +52,29 @@ function stats.load()
    return data
 end
 
---------------------------------
--- Opens the statfile
--- @return filehandle
-function stats.start()
-   return io.open(stats.statsfile, "w")
-end
+-----------------------------------------------------
+-- Saves data to the stats file.
+-- @param statsfile path to the stats file.
+-- @param data data to store.
+function stats.save(statsfile, data)
+   local fd = assert(io.open(statsfile, "w"))
 
---------------------------------
--- Closes the statfile
--- @param fd filehandle to the statsfile
-function stats.stop(fd)
-   fd:close()
-end
+   local filenames = {}
+   for filename in pairs(data) do
+      table.insert(filenames, filename)
+   end
+   table.sort(filenames)
 
---------------------------------
--- Saves data to the statfile
--- @param data data to store
--- @param fd filehandle where to store
-function stats.save(data, fd)
-   fd:seek("set")
-   for filename, filedata in pairs(data) do
-      local max = filedata.max
-      fd:write(max, ":", filename, "\n")
-      for i = 1, max do
-         local hits = filedata[i]
-         if not hits then
-            hits = 0
-         end
-         fd:write(hits, " ")
+   for _, filename in ipairs(filenames) do
+      local filedata = data[filename]
+      fd:write(filedata.max, ":", filename, "\n")
+
+      for i = 1, filedata.max do
+         fd:write(tostring(filedata[i] or 0), " ")
       end
       fd:write("\n")
    end
-   fd:flush()
+   fd:close()
 end
 
 return stats

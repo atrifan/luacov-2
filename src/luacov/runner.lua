@@ -5,13 +5,15 @@
 -- @name luacov.runner
 
 local runner = {}
+--- LuaCov version in `MAJOR.MINOR.PATCH` format.
+runner.version = "0.11.0"
 
 local stats = require("luacov.stats")
 runner.defaults = require("luacov.defaults")
 
 local debug = require("debug")
 
-local new_anchor = newproxy or function() return {} end
+local new_anchor = newproxy or function() return {} end -- luacheck: compat
 
 -- Returns an anchor that runs fn when collected.
 local function on_exit_wrap(fn)
@@ -20,8 +22,7 @@ local function on_exit_wrap(fn)
    return anchor
 end
 
-local data
-local statsfile
+local data = {}
 local tick
 local paused = true
 local initialized = false
@@ -51,21 +52,17 @@ end
 --------------------------------------------------
 -- Uses LuaCov's configuration to check if a file is included for
 -- coverage data collection.
+-- @param filename name of the file.
 -- @return true if file is included, false otherwise.
 function runner.file_included(filename)
    -- Normalize file names before using patterns.
    filename = string.gsub(filename, "\\", "/")
    filename = string.gsub(filename, "%.lua$", "")
 
-   if filelist[filename] == nil then
-      -- If include list is empty, everything is included by default.
-      local included = match_any(runner.configuration.include, filename, true)
-      -- If exclude list is empty, nothing is excluded by default.
-      local excluded = match_any(runner.configuration.exclude, filename, false)
-      filelist[filename] = included and not excluded
-   end
-
-   return filelist[filename]
+   -- If include list is empty, everything is included by default.
+   -- If exclude list is empty, nothing is excluded by default.
+   return match_any(runner.configuration.include, filename, true) and
+      not match_any(runner.configuration.exclude, filename, false)
 end
 
 --------------------------------------------------
@@ -84,6 +81,22 @@ function runner.update_stats(old_stats, extra_stats)
       old_stats[line_nr] = (old_stats[line_nr] or 0) + run_nr
       old_stats.max_hits = math.max(old_stats.max_hits, old_stats[line_nr])
    end
+end
+
+-- Adds accumulated stats to existing stats file or writes a new one, then resets data.
+local function save_stats()
+   local loaded = stats.load(runner.configuration.statsfile) or {}
+
+   for name, file_data in pairs(data) do
+      if loaded[name] then
+         runner.update_stats(loaded[name], file_data)
+      else
+         loaded[name] = file_data
+      end
+   end
+
+   stats.save(runner.configuration.statsfile, loaded)
+   data = {}
 end
 
 --------------------------------------------------
@@ -109,26 +122,23 @@ function runner.debug_hook(_, line_nr, level)
       return
    end
 
-   if tick then
-      ctr = ctr + 1
-      if ctr == runner.configuration.savestepsize then
-         ctr = 0
-
-         if not paused then
-            stats.save(data, statsfile)
-         end
-      end
-   end
-
    -- get name of processed file; ignore Lua code loaded from raw strings
    local name = debug.getinfo(level, "S").source
-   if string.match(name, "^@") then
-      name = string.sub(name, 2)
+   local prefixed_name = string.match(name, "^@(.*)")
+   if prefixed_name then
+      name = prefixed_name
    elseif not runner.configuration.codefromstrings then
       return
    end
 
-   if not runner.file_included(name) then
+   local included = filelist[name]
+
+   if included == nil then
+      included = runner.file_included(name)
+      filelist[name] = included
+   end
+
+   if not included then
       return
    end
 
@@ -140,8 +150,23 @@ function runner.debug_hook(_, line_nr, level)
    if line_nr > file.max then
       file.max = line_nr
    end
-   file[line_nr] = (file[line_nr] or 0) + 1
-   file.max_hits = math.max(file.max_hits, file[line_nr])
+
+   local hits = (file[line_nr] or 0) + 1
+   file[line_nr] = hits
+   if hits > file.max_hits then
+      file.max_hits = hits
+   end
+
+   if tick then
+      ctr = ctr + 1
+      if ctr == runner.configuration.savestepsize then
+         ctr = 0
+
+         if not paused then
+            save_stats()
+         end
+      end
+   end
 end
 
 ------------------------------------------------------
@@ -169,10 +194,11 @@ local function on_exit()
    -- so this method could be called twice
    if on_exit_run_once then return end
    on_exit_run_once = true
+   save_stats()
 
-   runner.pause()
-
-   if runner.configuration.runreport then runner.run_report(runner.configuration) end
+   if runner.configuration.runreport then
+      runner.run_report(runner.configuration)
+   end
 end
 
 -- Returns true if the given filename exists.
@@ -280,6 +306,7 @@ end
 --------------------------------------------------
 -- Returns real name for a source file name
 -- using `luacov.defaults.modules` option.
+-- @param filename name of the file.
 function runner.real_name(filename)
    local orig_filename = filename
    -- Normalize file names before using patterns.
@@ -370,63 +397,16 @@ function runner.load_config(configuration)
 end
 
 --------------------------------------------------
--- Pauses LuaCov's runner.
--- Saves collected data and stops, allowing other processes to write to
--- the same stats file. Data is still collected during pause.
+-- Pauses saving data collected by LuaCov's runner.
+-- Allows other processes to write to the same stats file.
+-- Data is still collected during pause.
 function runner.pause()
-   if paused then
-      return
-   end
-
    paused = true
-   stats.save(data, statsfile)
-   stats.stop(statsfile)
-   -- Reset data, so that after resuming it could be added to data loaded
-   -- from the stats file, possibly updated from another process.
-   data = {}
 end
 
 --------------------------------------------------
--- Resumes LuaCov's runner.
--- Reloads stats file, possibly updated from other processes,
--- and continues saving collected data.
+-- Resumes saving data collected by LuaCov's runner.
 function runner.resume()
-   if not paused then
-      return
-   end
-
-   local loaded = stats.load() or {}
-
-   if data then
-      for name, file in pairs(loaded) do
-         if data[name] then
-            runner.update_stats(data[name], file)
-         else
-            data[name] = file
-         end
-      end
-   else
-      data = loaded
-   end
-
-   statsfile = stats.start()
-   runner.statsfile = statsfile
-
-
-   if not tick then
-      -- As __gc hooks are called in reverse order of their creation,
-      -- and stats file has a __gc hook closing it,
-      -- the exit __gc hook writing data to stats file must be recreated
-      -- after stats file is reopened.
-
-      if runner.on_exit_trick then
-         -- Deactivate previous handler.
-         getmetatable(runner.on_exit_trick).__gc = nil
-      end
-
-      runner.on_exit_trick = on_exit_wrap(on_exit)
-   end
-
    paused = false
 end
 
@@ -474,14 +454,12 @@ end
 -- If table then config table (see file `luacov.default.lua` for an example)
 function runner.init(configuration)
    runner.configuration = runner.load_config(configuration)
-   stats.statsfile = runner.configuration.statsfile
-   tick = package.loaded["luacov.tick"]
-   runner.resume()
+   tick = runner.tick
 
    -- metatable trick on filehandle won't work if Lua exits through
    -- os.exit() hence wrap that with exit code as well
    local rawexit = os.exit
-   os.exit = function(...)
+   os.exit = function(...) -- luacheck: no global
       on_exit()
       rawexit(...)
    end
@@ -493,7 +471,7 @@ function runner.init(configuration)
       -- hence wrap coroutine function to set the hook there
       -- as well
       local rawcoroutinecreate = coroutine.create
-      coroutine.create = function(...)
+      coroutine.create = function(...) -- luacheck: no global
          local co = rawcoroutinecreate(...)
          debug.sethook(co, runner.debug_hook, "l")
          return co
@@ -508,7 +486,7 @@ function runner.init(configuration)
          end
       end
 
-      coroutine.wrap = function(...)
+      coroutine.wrap = function(...) -- luacheck: no global
          local co = rawcoroutinecreate(...)
          debug.sethook(co, runner.debug_hook, "l")
          return function(...)
@@ -517,7 +495,12 @@ function runner.init(configuration)
       end
    end
 
+   if not tick then
+      runner.on_exit_trick = on_exit_wrap(on_exit)
+   end
+
    initialized = true
+   paused = false
 end
 
 --------------------------------------------------
@@ -525,7 +508,7 @@ end
 -- This should only be called from daemon processes or sandboxes which have
 -- disabled os.exit and other hooks that are used to determine shutdown.
 function runner.shutdown()
-  on_exit()
+   on_exit()
 end
 
 -- Gets the sourcefilename from a function.
@@ -548,7 +531,7 @@ local function findfunction(t, searched)
 
    searched[t] = true
 
-   for k, v in pairs(t) do
+   for _, v in pairs(t) do
       if type(v) == "function" then
          return v
       elseif type(v) == "table" then
@@ -689,4 +672,4 @@ function runner.includetree(name, level)
 end
 
 
-return setmetatable(runner, { ["__call"] = function(self, configfile) runner.init(configfile) end })
+return setmetatable(runner, {__call = function(_, configfile) runner.init(configfile) end})

@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "LuaCov"
-version = "0.10.0-1"
+version = "0.11.0-1"
 -- LuaDist source
 source = {
   url = "git://github.com/LuaDist2/luacov.git",
-  tag = "0.10.0-1"
+  tag = "0.11.0-1"
 }
 -- Original source
 -- source = {
 --    url = "git://github.com/keplerproject/luacov",
---    tag = "v0.10.0"
+--    tag = "v0.11.0"
 -- }
 description = {
    summary = "Coverage analysis tool for Lua scripts",
