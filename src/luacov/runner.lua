@@ -6,12 +6,14 @@
 
 local runner = {}
 --- LuaCov version in `MAJOR.MINOR.PATCH` format.
-runner.version = "0.11.0"
+runner.version = "0.12.0"
 
 local stats = require("luacov.stats")
+local util = require("luacov.util")
 runner.defaults = require("luacov.defaults")
 
 local debug = require("debug")
+local raw_os_exit = os.exit
 
 local new_anchor = newproxy or function() return {} end -- luacheck: compat
 
@@ -22,14 +24,10 @@ local function on_exit_wrap(fn)
    return anchor
 end
 
-local data = {}
-local tick
-local paused = true
-local initialized = false
-local ctr = 0
-
-local filelist = {}
-runner.filelist = filelist
+runner.data = {}
+runner.paused = true
+runner.initialized = false
+runner.tick = false
 
 -- Checks if a string matches at least one of patterns.
 -- @param patterns array of patterns or nil
@@ -84,10 +82,10 @@ function runner.update_stats(old_stats, extra_stats)
 end
 
 -- Adds accumulated stats to existing stats file or writes a new one, then resets data.
-local function save_stats()
+function runner.save_stats()
    local loaded = stats.load(runner.configuration.statsfile) or {}
 
-   for name, file_data in pairs(data) do
+   for name, file_data in pairs(runner.data) do
       if loaded[name] then
          runner.update_stats(loaded[name], file_data)
       else
@@ -96,8 +94,10 @@ local function save_stats()
    end
 
    stats.save(runner.configuration.statsfile, loaded)
-   data = {}
+   runner.data = {}
 end
+
+local cluacov_ok = pcall(require, "cluacov.version")
 
 --------------------------------------------------
 -- Debug hook set by LuaCov.
@@ -113,61 +113,8 @@ end
 --    runner.debug_hook(_, line, 3)
 --    extra_processing(line)
 -- end
-function runner.debug_hook(_, line_nr, level)
-   -- Do not use string metamethods within this function:
-   -- they may be absent if it's called from a sandboxed environment
-   -- or because of carelessly implemented monkey-patching.
-   level = level or 2
-   if not initialized then
-      return
-   end
-
-   -- get name of processed file; ignore Lua code loaded from raw strings
-   local name = debug.getinfo(level, "S").source
-   local prefixed_name = string.match(name, "^@(.*)")
-   if prefixed_name then
-      name = prefixed_name
-   elseif not runner.configuration.codefromstrings then
-      return
-   end
-
-   local included = filelist[name]
-
-   if included == nil then
-      included = runner.file_included(name)
-      filelist[name] = included
-   end
-
-   if not included then
-      return
-   end
-
-   local file = data[name]
-   if not file then
-      file = {max = 0, max_hits = 0}
-      data[name] = file
-   end
-   if line_nr > file.max then
-      file.max = line_nr
-   end
-
-   local hits = (file[line_nr] or 0) + 1
-   file[line_nr] = hits
-   if hits > file.max_hits then
-      file.max_hits = hits
-   end
-
-   if tick then
-      ctr = ctr + 1
-      if ctr == runner.configuration.savestepsize then
-         ctr = 0
-
-         if not paused then
-            save_stats()
-         end
-      end
-   end
-end
+-- @function debug_hook
+runner.debug_hook = require(cluacov_ok and "cluacov.hook" or "luacov.hook").new(runner)
 
 ------------------------------------------------------
 -- Runs the reporter specified in configuration.
@@ -194,25 +141,19 @@ local function on_exit()
    -- so this method could be called twice
    if on_exit_run_once then return end
    on_exit_run_once = true
-   save_stats()
+   runner.save_stats()
 
    if runner.configuration.runreport then
       runner.run_report(runner.configuration)
    end
 end
 
--- Returns true if the given filename exists.
-local function file_exists(fname)
-   local f = io.open(fname)
-
-   if f then
-      f:close()
-      return true
-   end
-end
-
 local dir_sep = package.config:sub(1, 1)
 local wildcard_expansion = "[^/]+"
+
+if not dir_sep:find("[/\\]") then
+   dir_sep = "/"
+end
 
 local function escape_module_punctuation(ch)
    if ch == "." then
@@ -339,13 +280,42 @@ end
 -- Always exclude luacov's own files.
 local luacov_excludes = {
    "luacov$",
+   "luacov/hook$",
    "luacov/reporter$",
    "luacov/reporter/default$",
    "luacov/defaults$",
    "luacov/runner$",
    "luacov/stats$",
-   "luacov/tick$"
+   "luacov/tick$",
+   "luacov/util$",
+   "cluacov/version$"
 }
+
+local function is_absolute(path)
+   if path:sub(1, 1) == dir_sep or path:sub(1, 1) == "/" then
+      return true
+   end
+
+   if dir_sep == "\\" and path:find("^%a:") then
+      return true
+   end
+
+   return false
+end
+
+local function get_cur_dir()
+   local pwd_cmd = dir_sep == "\\" and "cd 2>nul" or "pwd 2>/dev/null"
+   local handler = io.popen(pwd_cmd, "r")
+   local cur_dir = handler:read("*a")
+   handler:close()
+   cur_dir = cur_dir:gsub("\r?\n$", "")
+
+   if cur_dir:sub(-1) ~= dir_sep and cur_dir:sub(-1) ~= "/" then
+      cur_dir = cur_dir .. dir_sep
+   end
+
+   return cur_dir
+end
 
 -- Sets configuration. If some options are missing, default values are used instead.
 local function set_config(configuration)
@@ -359,11 +329,53 @@ local function set_config(configuration)
       runner.configuration[option] = value
    end
 
+   -- Program using LuaCov may change directory during its execution.
+   -- Convert path options to absolute paths to use correct paths anyway.
+   local cur_dir
+
+   for _, option in ipairs({"statsfile", "reportfile"}) do
+      local path = runner.configuration[option]
+
+      if not is_absolute(path) then
+         cur_dir = cur_dir or get_cur_dir()
+         runner.configuration[option] = cur_dir .. path
+      end
+   end
+
    acknowledge_modules()
 
    for _, patt in ipairs(luacov_excludes) do
       table.insert(runner.configuration.exclude, patt)
    end
+
+   runner.tick = runner.tick or runner.configuration.tick
+end
+
+local function load_config_file(name, is_default)
+   local conf = setmetatable({}, {__index = _G})
+
+   local ok, ret, error_msg = util.load_config(name, conf)
+
+   if ok then
+      if type(ret) == "table" then
+         for key, value in pairs(ret) do
+            if conf[key] == nil then
+               conf[key] = value
+            end
+         end
+      end
+
+      return conf
+   end
+
+   local error_type = ret
+
+   if error_type == "read" and is_default then
+      return nil
+   end
+
+   io.stderr:write(("Error: couldn't %s config file %s: %s\n"):format(error_type, name, error_msg))
+   raw_os_exit(1)
 end
 
 local default_config_file = ".luacov"
@@ -378,14 +390,10 @@ local default_config_file = ".luacov"
 function runner.load_config(configuration)
    if not runner.configuration then
       if not configuration then
-         -- nothing provided, load from default location if possible
-         if file_exists(default_config_file) then
-            set_config(dofile(default_config_file))
-         else
-            set_config(runner.defaults)
-         end
+         -- Nothing provided, load from default location if possible.
+         set_config(load_config_file(default_config_file, true) or runner.defaults)
       elseif type(configuration) == "string" then
-         set_config(dofile(configuration))
+         set_config(load_config_file(configuration))
       elseif type(configuration) == "table" then
          set_config(configuration)
       else
@@ -401,13 +409,13 @@ end
 -- Allows other processes to write to the same stats file.
 -- Data is still collected during pause.
 function runner.pause()
-   paused = true
+   runner.paused = true
 end
 
 --------------------------------------------------
 -- Resumes saving data collected by LuaCov's runner.
 function runner.resume()
-   paused = false
+   runner.paused = false
 end
 
 local hook_per_thread
@@ -454,14 +462,12 @@ end
 -- If table then config table (see file `luacov.default.lua` for an example)
 function runner.init(configuration)
    runner.configuration = runner.load_config(configuration)
-   tick = runner.tick
 
    -- metatable trick on filehandle won't work if Lua exits through
    -- os.exit() hence wrap that with exit code as well
-   local rawexit = os.exit
    os.exit = function(...) -- luacheck: no global
       on_exit()
-      rawexit(...)
+      raw_os_exit(...)
    end
 
    debug.sethook(runner.debug_hook, "l")
@@ -495,12 +501,12 @@ function runner.init(configuration)
       end
    end
 
-   if not tick then
+   if not runner.tick then
       runner.on_exit_trick = on_exit_wrap(on_exit)
    end
 
-   initialized = true
-   paused = false
+   runner.initialized = true
+   runner.paused = false
 end
 
 --------------------------------------------------
@@ -570,7 +576,7 @@ local function getfilename(name)
          error("Bad argument: " .. tostring(name))
       end
 
-      if file_exists(name) then
+      if util.file_exists(name) then
          return name
       end
 

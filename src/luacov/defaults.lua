@@ -1,7 +1,7 @@
---- Default configuration file. Copy, customize and store in your
--- project folder as '.luacov' for project specific configuration.
--- If some options are missing, their default values from this file
--- will be used.
+--- Default values for configuration options.
+-- For project specific configuration create '.luacov' file in your project
+-- folder. It should be a Lua script setting various options as globals
+-- or returning table of options.
 -- @class module
 -- @name luacov.defaults
 return {
@@ -11,6 +11,11 @@ return {
 
   --- Filename to store report. Default: "luacov.report.out".
   reportfile = "luacov.report.out",
+
+  --- Enable saving coverage data after every `savestepsize` lines?
+  -- Setting this flag to `true` in config is equivalent to running LuaCov
+  -- using `luacov.tick` module. Default: false.
+  tick = false,
 
   --- Stats file updating frequency for `luacov.tick`.
   -- The lower this value - the more frequently results will be written out to the stats file.

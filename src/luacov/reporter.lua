@@ -5,6 +5,7 @@
 local reporter = {}
 
 local luacov = require("luacov.runner")
+local util = require("luacov.util")
 
 -- Raw version of string.gsub
 local function replace(s, old, new)
@@ -424,6 +425,13 @@ end
 function ReporterBase:on_new_file(filename)
 end
 
+--- Stub method called if a file couldn't be processed due to an error.
+-- @param filename name of the file.
+-- @param error_type "open", "read" or "load".
+-- @param message error message.
+function ReporterBase:on_file_error(filename, error_type, message)
+end
+
 --- Stub method called for each empty source line
 -- and other lines that can't be hit.
 -- @param filename name of the file.
@@ -460,45 +468,85 @@ end
 
 -- luacheck: pop
 
+local cluacov_ok = pcall(require, "cluacov.version")
+local deepactivelines
+
+if cluacov_ok then
+   deepactivelines = require("cluacov.deepactivelines")
+end
+
+function ReporterBase:_run_file(filename)
+   local file, open_err = io.open(filename)
+
+   if not file then
+      self:on_file_error(filename, "open", util.unprefix(open_err, filename .. ": "))
+      return
+   end
+
+   local active_lines
+
+   if cluacov_ok then
+      local src, read_err = file:read("*a")
+
+      if not src then
+         self:on_file_error(filename, "read", read_err)
+         return
+      end
+
+      local func, load_err = util.load_string(src, nil, "@file")
+
+      if not func then
+         self:on_file_error(filename, "load", "line " .. util.unprefix(load_err, "file:"))
+         return
+      end
+
+      active_lines = deepactivelines.get(func)
+      file:seek("set")
+   end
+
+   self:on_new_file(filename)
+   local file_hits, file_miss = 0, 0
+   local filedata = self:stats(filename)
+
+   local line_nr = 1
+   local scanner = LineScanner:new()
+
+   while true do
+      local line = file:read("*l")
+      if not line then break end
+
+      local always_excluded, excluded_when_not_hit = scanner:consume(line)
+      local hits = filedata[line_nr] or 0
+      local included = not always_excluded and (not excluded_when_not_hit or hits ~= 0)
+
+      if cluacov_ok then
+         included = included and active_lines[line_nr]
+      end
+
+      if included then
+         if hits == 0 then
+            self:on_mis_line(filename, line_nr, line)
+            file_miss = file_miss + 1
+         else
+            self:on_hit_line(filename, line_nr, line, hits)
+            file_hits = file_hits + 1
+         end
+      else
+         self:on_empty_line(filename, line_nr, line)
+      end
+
+      line_nr = line_nr + 1
+   end
+
+   file:close()
+   self:on_end_file(filename, file_hits, file_miss)
+end
+
 function ReporterBase:run()
    self:on_start()
 
    for _, filename in ipairs(self:files()) do
-      local file = io.open(filename, "r")
-
-      if not file then
-         print("Could not open file " .. filename)
-      else
-         self:on_new_file(filename)
-         local file_hits, file_miss = 0, 0
-         local filedata = self:stats(filename)
-
-         local line_nr = 1
-         local scanner = LineScanner:new()
-
-         while true do
-            local line = file:read("*l")
-            if not line then break end
-
-            local always_excluded, excluded_when_not_hit = scanner:consume(line)
-            local hits = filedata[line_nr] or 0
-
-            if always_excluded or (excluded_when_not_hit and hits == 0) then
-               self:on_empty_line(filename, line_nr, line)
-            elseif hits == 0 then
-               self:on_mis_line(filename, line_nr, line)
-               file_miss = file_miss + 1
-            else
-               self:on_hit_line(filename, line_nr, line, hits)
-               file_hits = file_hits + 1
-            end
-
-            line_nr = line_nr + 1
-         end
-
-         file:close()
-         self:on_end_file(filename, file_hits, file_miss)
-      end
+      self:_run_file(filename)
    end
 
    self:on_end()
@@ -527,6 +575,10 @@ function DefaultReporter:on_new_file(filename)
    self:write(("="):rep(78), "\n")
    self:write(filename, "\n")
    self:write(("="):rep(78), "\n")
+end
+
+function DefaultReporter:on_file_error(filename, error_type, message) --luacheck: no self
+   io.stderr:write(("Couldn't %s %s: %s\n"):format(error_type, filename, message))
 end
 
 function DefaultReporter:on_empty_line(_, _, line)
